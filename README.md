@@ -145,74 +145,35 @@ One gossip round copies a packet to every device that does not already hold that
 
 ---
 
-## The three hard problems and how they're solved
+## The Three Hard Problems and How They're Solved
 
-### Problem 1: Untrusted intermediates
+### Untrusted intermediaries
 
-A simulated relay holds the packet. The payment fields sit inside the ciphertext.
+A simulated relay can read `packetId`, `ttl`, and `createdAt`. The payment fields stay inside the ciphertext.
 
-**Implemented scheme: RSA-OAEP plus AES-256-GCM.**
+`HybridCryptoService` creates a new AES-256 key for every packet. AES-256-GCM encrypts the payment JSON and checks an authentication tag on decrypt, so a modified ciphertext is rejected as `INVALID`. RSA-OAEP wraps that AES key with the server public key. These are separate primitives. They are not the TLS protocol.
 
-`HybridCryptoService` uses `RSA/ECB/OAEPWithSHA-256AndMGF1Padding` and `AES/GCM/NoPadding`. For each packet it:
+`ServerKeyHolder` generates an RSA-2048 key pair when the process starts and discards it when the process exits. `GET /api/server-key` returns the public key.
 
-1. Generates a new AES-256 key.
-2. Encrypts the payment JSON with AES-256-GCM, using a 12-byte IV and a 128-bit tag.
-3. Wraps that 32-byte AES key with RSA-OAEP and the server public key.
-4. Concatenates `[256-byte RSA-wrapped AES key][12-byte IV][AES ciphertext including the 16-byte tag]` and Base64-encodes it.
+### Duplicate deliveries
 
-RSA-2048 with OAEP-SHA-256 can encrypt at most 190 bytes (`256 - 2×32 - 2`). The AES key fits. The payment JSON is not encrypted directly with RSA.
+`ingest` hashes the ciphertext string with SHA-256 and claims that hash with `ConcurrentHashMap.putIfAbsent`. The first caller continues. Any later caller for the same hash gets `DUPLICATE_DROPPED` before decryption. The server hashes the ciphertext rather than `packetId`, because a relay can change that outer field, while gossip copies the same ciphertext bytes.
 
-AES-GCM checks the tag on decrypt. A changed ciphertext throws, and `ingest` returns `INVALID`. These are the primitives in `HybridCryptoService`. They are not the TLS protocol.
+The map lives in this JVM only. It is not a distributed lock. Redis `SET NX` is a proposed replacement if more than one server had to share the claim. This repository has no Redis client.
 
-The RSA key pair is generated in `ServerKeyHolder` on startup and is discarded when the process exits. `GET /api/server-key` returns the public key as Base64, plus the strings `RSA-2048 / OAEP-SHA256` and a short hybrid-scheme label.
+`IdempotencyConcurrencyTest#singlePacketDeliveredByThreeBridgesSettlesExactlyOnce` delivers one ₹100.00 packet on three threads at once. The test expects one `SETTLED` outcome and two `DUPLICATE_DROPPED` outcomes.
 
-### Problem 2: The duplicate-storm
+<img src="docs/idempotency-flow.png" alt="Idempotency flow for three concurrent deliveries of one packet" width="800">
 
-If several online devices hold the same ciphertext, each can call `ingest`. Processing every call would debit the sender once per call.
+`POST /api/bridge/ingest` returns HTTP 200 for `SETTLED`, `DUPLICATE_DROPPED`, and `INVALID`. The JSON `outcome` tells them apart. The diagram's 409 labels and Redis label do not match this process. A failed decrypt or freshness check does not release the claim, so a later copy of that ciphertext is `DUPLICATE_DROPPED`. The unique `packet_hash` column is only a fallback if a second ledger insert is attempted. That failure comes back as `INVALID`, which is not the normal duplicate path.
 
-Three `ingest` calls for one ₹500 ciphertext would debit ₹1500 if the claim were skipped. That figure is an illustration. Clicking **Inject into Mesh** three times does not create that case: each click builds a new ciphertext. The test uses one ₹100.00 packet and three threads.
+### Replay attacks
 
-**Implemented claim:** hash the ciphertext, then `putIfAbsent`.
+The hash claim above drops a repeated ciphertext until that map entry expires. A second genuine payment gets a new UUID nonce, so its ciphertext and hash differ and it can settle on its own. Changing the nonce or `signedAt` inside a captured packet fails the AES-GCM tag.
 
-```java
-// IdempotencyService.java
-Instant prev = seen.putIfAbsent(packetHash, now);
-return prev == null;  // true = first claimer, false = duplicate
-```
+`signedAt` is checked on the call that claims the hash. A packet older than 24 hours (`upi.mesh.packet-max-age-seconds=86400`) returns `INVALID` with reason `stale_packet`. A `signedAt` more than 300 seconds ahead of the server clock returns `INVALID` with reason `future_dated`.
 
-One caller receives `null` and continues. Other callers for that hash receive the existing entry and get outcome `DUPLICATE_DROPPED` before decrypt. The map lives in this JVM. Entries older than `upi.mesh.idempotency-ttl-seconds` (86400) are removed by a job scheduled every 60 seconds. The test checks three threads, not a larger pool.
-
-![Idempotency sequence for three concurrent deliveries of one packet, next to a smaller copy of the architecture.](docs/idempotency-flow.png)
-
-Read the right-hand sequence as the intended claim order, with these corrections from the code:
-
-- Duplicate calls are not HTTP 409. `POST /api/bridge/ingest` returns HTTP 200 for `SETTLED`, `DUPLICATE_DROPPED`, and `INVALID`. The body field `outcome` distinguishes them. Flush does not go through HTTP.
-- The Redis label is a production analogy. This process uses `ConcurrentHashMap` only.
-- A failed decrypt or a failed freshness check does not remove the claim. A later copy of that same ciphertext is `DUPLICATE_DROPPED`, not a second `INVALID`.
-
-**Why the hash is the ciphertext string, not `packetId` or the plaintext**
-
-- `packetId` is an outer field. A relay can change it. Gossip dedupes on `packetId`; the server does not.
-- Hashing the plaintext would require decrypting before the claim.
-- Gossip copies the ciphertext bytes. It does not encrypt again. Two deliveries of that same packet therefore have the same hash. A second legitimate payment gets a new nonce, a new AES key, and a new IV, so it has a new hash.
-
-`transactions.packet_hash` is unique. A second insert of the same hash fails. `ingest` catches that exception and returns `INVALID` with an `internal_error` reason. That path is not `DUPLICATE_DROPPED`. The normal duplicate path is the map. `TransactionRepository.existsByPacketHash` is unused.
-
-`Account.version` is a JPA `@Version` column. The concurrency test does not assert an optimistic-lock failure.
-
-A production deployment that runs more than one server would need a shared claim, such as Redis `SET key NX EX`. That client is not in this repository.
-
-### Problem 3: Replay
-
-`PaymentInstruction` carries `signedAt` (epoch millis) and a UUID `nonce`, both inside the ciphertext.
-
-1. The first `ingest` of a ciphertext claims its hash. Further copies are `DUPLICATE_DROPPED` until that map entry is evicted.
-2. `signedAt` older than 86400 seconds returns `INVALID` / `stale_packet` on the call that first claims the hash. `signedAt` more than 300 seconds ahead of the server clock returns `INVALID` / `future_dated`.
-3. Two payments from Alice to Bob with the same amount differ in nonce, so they differ in ciphertext and can both settle. A byte-identical ciphertext cannot.
-
-Changing `signedAt` or the nonce inside a captured packet breaks the GCM tag.
-
-The PIN is not a replay control. The server stores a SHA-256 hex of the PIN string and never compares it to a stored secret.
+The PIN is not part of this check. The server stores a SHA-256 of the PIN string and never verifies it.
 
 ---
 
