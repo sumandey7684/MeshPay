@@ -106,64 +106,25 @@ On PowerShell, use `.\mvnw.cmd test`. The class is `IdempotencyConcurrencyTest`.
 
 ## The demo flow (step by step)
 
-The mesh controls walk through encryption, simulated gossip, and one bridge upload.
+### Step 1 — Compose a payment and encrypt it
 
-### Step 1 — Compose a payment
+Choose sender, receiver, amount, and a 4-digit PIN, then click **Inject into Mesh**. The server stores a SHA-256 of the PIN and does not verify it. It encrypts the payment with the server public key and holds the ciphertext on `phone-alice`.
 
-Choose sender, receiver, amount, and a 4-digit PIN. Click **Inject into Mesh**.
+### Step 2 — Run simulated mesh gossip
 
-The dashboard `POST`s `/api/demo/send` with `ttl: 5` and `startDevice: "phone-alice"`. `DemoService.createPacket` then:
+Click **Run One Round**. This process copies the packet to the other virtual devices. The mesh is simulated: there is no Bluetooth radio, and devices do not have to come into range.
 
-- builds a `PaymentInstruction` with a new UUID nonce and `signedAt` set to the current time
-- stores `SHA-256` of the PIN string in `pinHash` and does not check it against an account
-- encrypts that object with the server public key
-- wraps the ciphertext in a `MeshPacket` and holds it on `phone-alice`
+### Step 3 — Upload from the bridge and settle the transaction
 
-`phone-alice` then shows a queue of 1. The other devices are still empty.
+Click **Upload from Bridge**. `phone-bridge` is already online. Flush calls `BridgeIngestionService.ingest` in this process. It does not make an HTTP request to `/api/bridge/ingest`. Settlement is deferred until that call. If the sender's balance covers the amount, the balances move; if it does not, they stay unchanged.
 
-### Step 2 — Run gossip rounds
+### Step 4 — Verify concurrent idempotency through the automated test
 
-Click **Run One Round**.
-
-`MeshSimulatorService.gossipOnce` treats every device as in range of every other device. Each device that holds a packet with `ttl > 0` offers a copy to the others. A device that already holds that `packetId` keeps its existing copy. A new copy is stored with `ttl - 1`.
-
-Starting from `phone-alice` at TTL 5, one round leaves the other four devices holding a copy at TTL 4. `phone-alice` still holds TTL 5. A second round does not transfer that packet again, and it does not lower the TTL already stored.
-
-This is not Bluetooth. Nothing in the simulator waits for devices to move into range.
-
-### Step 3 — Upload from the bridge
-
-Click **Upload from Bridge**.
-
-`phone-bridge` is created already online. The click does not change connectivity. `POST /api/mesh/flush` collects packets held by devices with `hasInternet=true` and calls `BridgeIngestionService.ingest` in this process, in parallel. It does not make an HTTP request to `/api/bridge/ingest`. With the default seed that is one call.
-
-The hop count passed by flush is `5 - packet.ttl`. After one gossip round, the bridge copy has TTL 4, so the stored hop count is 1. That number is not a count of how many devices held the packet.
-
-`ingest` then:
-
-1. Hashes the base64 ciphertext string with SHA-256.
-2. Calls `IdempotencyService.claim`. A false result returns outcome `DUPLICATE_DROPPED` and does not decrypt.
-3. Decrypts. Failure returns outcome `INVALID` and reason `decryption_failed`. The hash stays claimed.
-4. Rejects `signedAt` older than `upi.mesh.packet-max-age-seconds` (86400) as `stale_packet`, and `signedAt` more than 300 seconds in the future as `future_dated`. The hash stays claimed.
-5. Calls `SettlementService.settle` in one database transaction.
-
-If the sender balance covers the amount, the ledger row status is `SETTLED` and the balances move. If it does not, the ledger row status is `REJECTED`, balances stay put, and the JSON `outcome` is still `SETTLED`, because `ingest` labels every transaction returned by `settle` that way. An unknown VPA or a non-positive amount throws and becomes outcome `INVALID`.
-
-The Account Balances and Transaction Ledger tables show the H2 rows. Ledger status is only `SETTLED` or `REJECTED`. `DUPLICATE_DROPPED` and `INVALID` are ingest outcomes, not ledger statuses. The dashboard filter also lists Pending, Duplicate, and Invalid; those values do not match rows this backend writes.
-
-### Step 4 — Where concurrent idempotency is proved
-
-Gossip can place one packet on all five devices. The default seed still has one bridge, so **Upload from Bridge** calls `ingest` once.
-
-The concurrent case is the test:
+The default dashboard has one bridge, so the upload above delivers a packet once. Concurrent delivery is proved by `IdempotencyConcurrencyTest#singlePacketDeliveredByThreeBridgesSettlesExactlyOnce`: three simultaneous deliveries of one ₹100.00 packet produce one `SETTLED` outcome and two `DUPLICATE_DROPPED` outcomes.
 
 ```cmd
 mvnw.cmd test -Dtest=IdempotencyConcurrencyTest#singlePacketDeliveredByThreeBridgesSettlesExactlyOnce
 ```
-
-That test builds one ₹100.00 packet from `alice@demo` to `bob@demo`, starts three threads together, and calls `ingest` on each. It asserts exactly one `SETTLED`, two `DUPLICATE_DROPPED`, and a single ₹100.00 balance change. It does not assert an HTTP status.
-
-`seedDefaultDevices()` is private. Editing it so more than one device is constructed with internet would make flush call `ingest` more than once. The default seed does not do that, and the test above is the checked concurrent path.
 
 ---
 
@@ -179,6 +140,8 @@ The picture is a concept drawing. These details follow the code instead:
 - The upload arrow is labeled HTTPS. This demo listens on HTTP port 8080. Dashboard flush does not use HTTP for ingest; it calls `BridgeIngestionService` directly. `POST /api/bridge/ingest` is the HTTP entry to the same method.
 - The claim step is labeled with Redis `SETNX` as an example. The implementation is `ConcurrentHashMap.putIfAbsent` in this process.
 - `phone-bridge` starts online. The demo does not animate a phone walking into coverage.
+
+One gossip round copies a packet to every device that does not already hold that `packetId`, and stores the new copy at `ttl - 1`. The holder's existing copy keeps its TTL. A later round does not forward a packet a device already holds, so those stored TTLs stay as they are. From `phone-alice` at the default TTL of 5, one round leaves the other four devices at TTL 4.
 
 ---
 
@@ -347,9 +310,9 @@ HTTP 200 body:
 }
 ```
 
-`outcome` is `SETTLED`, `DUPLICATE_DROPPED`, or `INVALID`. `reason` is set for `INVALID` (`decryption_failed`, `stale_packet`, `future_dated`, or `internal_error: ...`). `transactionId` is set when `settle` returns a row, including a row whose ledger status is `REJECTED`. Duplicate and invalid results leave `transactionId` null. This endpoint is not authenticated.
+`outcome` is `SETTLED`, `DUPLICATE_DROPPED`, or `INVALID`. `reason` is set for `INVALID` (`decryption_failed`, `stale_packet`, `future_dated`, or `internal_error: ...`). An unknown VPA or a non-positive amount becomes `INVALID` with an `internal_error` reason. `transactionId` is set when `settle` returns a row, including a row whose ledger status is `REJECTED`. Duplicate and invalid results leave `transactionId` null. A saved ledger row is only `SETTLED` or `REJECTED`. The dashboard filter also lists Pending, Duplicate, and Invalid; this backend does not write those as ledger statuses. This endpoint is not authenticated.
 
-`POST /api/mesh/flush` does not send this HTTP request. It calls the same service method with the device id and hop count `5 - ttl`.
+`POST /api/mesh/flush` does not send this HTTP request. It calls the same service method with the device id and hop count `5 - ttl`. After one gossip round the bridge copy is at TTL 4, so that hop count is 1. It is not the number of devices that held the packet.
 
 ---
 
