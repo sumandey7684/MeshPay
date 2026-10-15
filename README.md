@@ -1,8 +1,27 @@
-# UPI Offline Mesh — Demo
+# MeshPay
 
-A Spring Boot backend that demonstrates **offline UPI payments routed through a Bluetooth-style mesh network**. You're in a basement with zero connectivity. You send your friend ₹500. Your phone encrypts the payment, broadcasts it to nearby phones, and the packet hops device-to-device until *some* phone walks outside, gets 4G, and silently uploads it to this backend. The backend decrypts, deduplicates, and settles.
+MeshPay is a simulated offline payment-mesh demo. It shows **mesh-routed deferred settlement of UPI-style payments**: a sender with no connectivity encrypts a payment, virtual phones hop the ciphertext, and a bridge node that later has a network connection uploads it to this backend. The backend decrypts, drops duplicates, and settles.
 
-This repo is the **server side** of that system, plus a software simulator of the mesh so you can demo the whole flow on a single laptop without any real Bluetooth hardware.
+This repository is the server side of that demo, plus a software simulator of the mesh. You can run the flow on one laptop. There is no real Bluetooth hardware, no NPCI connection, and no production payment rail.
+
+Picture a basement with no signal. You send a friend ₹500. The demo encrypts that instruction, gossips it across simulated phones, and settles it only after a bridge upload reaches the server.
+
+---
+
+## Ownership
+
+| | |
+|---|---|
+| Author | Suman, the author recorded on this repository's only commit (`sumandey7684@gmail.com`) |
+| Repository | https://github.com/sumandey7684/MeshPay |
+| Project role | Spring Boot backend and in-process mesh simulator for the demo above |
+| Recorded date | 15 October 2026, the author date of the commit whose message is `first commit`. Git has no earlier history, so dates before that commit are not recorded |
+| Stack | Java 17, Spring Boot 3.3.5 |
+| Run | Windows: `mvnw.cmd spring-boot:run` (PowerShell: `.\mvnw.cmd spring-boot:run`). macOS/Linux: `./mvnw spring-boot:run` |
+
+Java packages stay `com.demo.upimesh`. The Maven artifact id in `pom.xml` stays `upi-offline-mesh`.
+
+The only commit adds this demo in its current form: backend, simulator, dashboard, and tests. The repository does not record a split of work across people, or a development timeline before that commit.
 
 ---
 
@@ -23,13 +42,15 @@ This repo is the **server side** of that system, plus a software simulator of th
 
 ## What this demo proves
 
-The system shows three things working end to end:
+MeshPay is built to show three properties:
 
-1. **A payment can travel from sender to backend through untrusted intermediaries** without any of them being able to read or tamper with it. (Hybrid RSA + AES-GCM encryption.)
-2. **Even if the same payment reaches the backend simultaneously through multiple bridge nodes, it settles exactly once.** (Idempotency via atomic compare-and-set on the ciphertext hash.)
+1. **A payment can travel from sender to backend through untrusted intermediaries** without any of them being able to read or tamper with it. (RSA-OAEP wraps a one-time AES-256 key; AES-256-GCM encrypts the payload.)
+2. **The same payment, delivered more than once, settles exactly once.** (Idempotency via atomic compare-and-set on the ciphertext hash.)
 3. **A tampered or replayed packet is rejected** before it touches the ledger.
 
-You'll see all three in the dashboard.
+**What the dashboard shows.** With the default device seed, the dashboard demonstrates encryption, simulated gossip, and a single bridge upload. That seed has one device with internet: `phone-bridge`. **Upload from Bridge** therefore sends each packet once.
+
+**What the test shows.** Concurrent duplicate protection is `IdempotencyConcurrencyTest#singlePacketDeliveredByThreeBridgesSettlesExactlyOnce`. It delivers one packet on three threads at the same time and asserts exactly one `SETTLED` outcome, two `DUPLICATE_DROPPED` outcomes, and a single ₹100.00 movement between `alice@demo` and `bob@demo`. The default dashboard flow does not run that case.
 
 ---
 
@@ -62,7 +83,7 @@ Once you see `Started UpiMeshApplication in X.XXX seconds`, open:
 
 **http://localhost:8080**
 
-You'll get a dark dashboard with everything you need to drive the demo.
+The page follows the browser color scheme and has a light/dark toggle. It is the control surface for the demo.
 
 ### Stop the server
 
@@ -80,11 +101,11 @@ The interesting one is `IdempotencyConcurrencyTest` — it fires three threads d
 
 ## The demo flow (step by step)
 
-The dashboard has four buttons that walk through the full pipeline. The intended sequence:
+The mesh controls walk through encryption, simulated gossip, and one bridge upload. The intended sequence:
 
 ### Step 1 — Compose a payment
 
-Choose sender, receiver, amount, PIN. Click **"📤 Inject into Mesh"**.
+Choose sender, receiver, amount, and a 4-digit PIN. Click **Inject into Mesh**. The dashboard sends that payment with TTL 5, starting at `phone-alice`.
 
 **What actually happens on the backend:**
 - The server pretends to be the sender's phone.
@@ -97,7 +118,7 @@ You'll see `phone-alice` now holds 1 packet.
 
 ### Step 2 — Run gossip rounds
 
-Click **"🔄 Run Gossip Round"**. Then click it again.
+Click **Run One Round**. Then click it again.
 
 Each round, every device that holds a packet broadcasts it to every other device within "Bluetooth range" (which, in our simulator, means everyone). TTL decrements per hop.
 
@@ -107,7 +128,7 @@ In the real system this would happen organically as people walk past each other 
 
 ### Step 3 — Bridge node walks outside
 
-Click **"📡 Bridges Upload to Backend"**.
+Click **Upload from Bridge**.
 
 `phone-bridge` is the only device with `hasInternet=true`. The dashboard simulates that phone walking outside and getting 4G. It POSTs every packet it holds to `/api/bridge/ingest`.
 
@@ -120,22 +141,19 @@ The backend pipeline runs:
 
 Watch the **Account Balances** table — money has moved. Watch the **Transaction Ledger** — a new row appears.
 
-### Step 4 — Demonstrate idempotency (the killer feature)
+### Step 4 — Where idempotency is actually proved
 
-Reset the mesh. Inject a single packet. Run gossip 2 times. Now **all 5 devices hold the same packet, including multiple bridges in a more complex setup**.
+Gossip copies one packet onto all five virtual devices. The default seed still has a single bridge, `phone-bridge`, so **Upload from Bridge** sends that packet once. That path shows a normal settlement. It does not show three bridges racing.
 
-To really see idempotency in action, modify `MeshSimulatorService.java` to seed multiple bridge devices, or just:
+Concurrent duplicate protection is the test, not the default dashboard:
 
-1. Click "Inject" once.
-2. Click "Gossip" twice.
-3. Click "Flush Bridges" — only `phone-bridge` is a bridge in the default seed, so just one upload happens.
-
-To exercise the *concurrent duplicate* case properly, run the test:
 ```cmd
 mvnw.cmd test -Dtest=IdempotencyConcurrencyTest#singlePacketDeliveredByThreeBridgesSettlesExactlyOnce
 ```
 
-This test creates one packet, fires 3 threads at `BridgeIngestionService.ingest()` simultaneously, and verifies that exactly one settles, two are dropped as duplicates, and the sender is debited exactly once.
+That test builds one packet for ₹100.00, calls `BridgeIngestionService.ingest()` from three threads at the same time, and asserts exactly one `SETTLED`, two `DUPLICATE_DROPPED`, and a single debit and credit of ₹100.00.
+
+To watch more than one bridge from the dashboard, change `MeshSimulatorService.seedDefaultDevices()` so more than one device is constructed with internet. The default seed does not do that.
 
 ---
 
@@ -201,13 +219,13 @@ But RSA can only encrypt small data (~245 bytes for a 2048-bit key), and our pay
 3. Encrypt just the AES key with **RSA-OAEP**.
 4. Concatenate: `[256 bytes RSA-encrypted AES key][12 bytes IV][AES ciphertext + 16-byte GCM tag]`.
 
-**Why GCM specifically?** It's authenticated encryption. If an intermediate flips one bit anywhere in the ciphertext, decryption throws an exception — the GCM tag won't verify. The server cannot be tricked into processing tampered data.
+**Why GCM specifically?** AES-GCM is authenticated encryption. If an intermediate flips one bit anywhere in the ciphertext, decryption throws an exception — the GCM tag will not verify. The server cannot be tricked into processing tampered data.
 
-This is the same scheme TLS uses. See `HybridCryptoService.java`.
+RSA-OAEP wraps the one-time AES-256 key. AES-256-GCM encrypts the payment JSON and checks the authentication tag on decrypt. Those are the primitives in `HybridCryptoService.java`. They are not the TLS protocol.
 
 ### Problem 2: The duplicate-storm
 
-Three bridge nodes hold the same packet. They all walk outside at the same instant. They all POST to `/api/bridge/ingest` within milliseconds of each other. If you naively process all three, the sender is debited ₹1500 instead of ₹500.
+Three bridge nodes hold the same packet. They all walk outside at the same instant. They all POST to `/api/bridge/ingest` within milliseconds of each other. If you naively process all three copies of a ₹500 payment, the sender is debited ₹1500. That figure is an illustration. The automated test uses ₹100.00, and it is the evidence for the concurrent case.
 
 **Solution: Atomic compare-and-set on the ciphertext hash.**
 
@@ -245,9 +263,11 @@ See `BridgeIngestionService.java` for the freshness check.
 
 ## File-by-file walkthrough
 
+The project folder is MeshPay. Packages in the tree below stay `com.demo.upimesh`.
+
 ```
-upi-offline-mesh/
-├── pom.xml                                  Maven build, Spring Boot 3.3, Java 17
+MeshPay/
+├── pom.xml                                  Maven build, Spring Boot 3.3.5, Java 17
 ├── mvnw, mvnw.cmd                           Maven wrapper (no install needed)
 ├── README.md                                this file
 └── src/main/
@@ -347,7 +367,7 @@ The three included tests:
 
 - **`encryptDecryptRoundTrip`** — sanity-check that hybrid encryption is symmetric.
 - **`tamperedCiphertextIsRejected`** — flip a byte in the ciphertext, verify that `BridgeIngestionService` returns `INVALID` instead of crashing or settling.
-- **`singlePacketDeliveredByThreeBridgesSettlesExactlyOnce`** — the headline test. Three threads, one packet, simultaneous delivery. Asserts exactly one `SETTLED`, two `DUPLICATE_DROPPED`, and that the sender's balance changed by exactly the amount once.
+- **`singlePacketDeliveredByThreeBridgesSettlesExactlyOnce`** — the concurrent-delivery test. Three threads call `ingest` on one ₹100.00 packet at the same time. Asserts exactly one `SETTLED`, two `DUPLICATE_DROPPED`, and a single ₹100.00 debit and credit. This is separate from the default dashboard, which has one bridge.
 
 ---
 
@@ -369,13 +389,13 @@ This is a teaching demo. To make it production-grade you'd swap these things:
 | No rate limiting | Per-bridge-node rate limit, per-sender velocity check |
 | Logs to console | Structured logs to a SIEM, alerts on `INVALID` spikes |
 
-The cryptography and idempotency code is essentially production-shaped. The infrastructure around it is what changes.
+The demo keeps hybrid encryption and the in-process idempotency check. The table is what a production deployment would still have to replace.
 
 ---
 
 ## Honest limitations of the concept
 
-I want this README to be useful to you when someone reviews the project, so let's be straight about what this design **does not** solve. These are not implementation bugs — they're inherent to "no internet, anywhere in the chain":
+These limits are what the design does not solve. They are inherent to having no connectivity anywhere in the chain. They are not implementation bugs:
 
 1. **The receiver has no way to verify the sender has the funds.** When sender hands receiver a phone showing "₹500 sent," it's an IOU, not a settled payment. If the sender's account is empty when the packet finally reaches the backend, the settlement will be `REJECTED` and the receiver is out ₹500 with no recourse. *This is why real offline UPI (UPI Lite) uses a pre-funded hardware-backed wallet* — to give cryptographic proof of available funds offline.
 2. **A malicious sender can double-spend offline.** With ₹500 in their account, they could send a packet to Bob in basement A, walk to basement B, and send another ₹500 to Carol. Whichever packet hits the backend first wins; the other gets `REJECTED`. Same root cause as #1.
@@ -402,4 +422,4 @@ For a college / portfolio project: name the concept honestly as **"mesh-routed d
 
 ## License
 
-Demo code, no license. Use it however you want for learning.
+This repository has no `LICENSE` file, and this README does not grant one. Reading and running the demo locally is what the project is published for. Copying, modification, and redistribution are not permitted until the owner adds an explicit license.
