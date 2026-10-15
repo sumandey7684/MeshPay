@@ -79,6 +79,10 @@ On PowerShell, use `.\mvnw.cmd spring-boot:run`.
 
 When the log shows `Started UpiMeshApplication`, open **http://localhost:8080**. The port is `server.port` in `application.properties`. The page follows the browser color scheme and has a light/dark toggle.
 
+![MeshPay dashboard on Network Overview: payment form, five simulated devices, and mesh controls.](docs/meshpay-dashboard.png)
+
+The screenshot is that page. The form shows `alice@demo` to `bob@demo` for ₹500. The topology shows the five seeded devices. Only `phone-bridge` is the bridge; the "Online" label is the dashboard's default device status, not an internet connection.
+
 Startup seeds four accounts when the table is empty:
 
 | VPA | Holder | Balance |
@@ -188,7 +192,8 @@ MeshPay/
 ├── README.md                                this file
 ├── docs/
 │   ├── system-architecture.png              Architecture figure used above
-│   └── idempotency-flow.png                 Idempotency figure used above
+│   ├── idempotency-flow.png                 Idempotency figure used above
+│   └── meshpay-dashboard.png                Dashboard screenshot used above
 └── src/main/
     ├── resources/
     │   ├── application.properties           H2, port 8080, 86400-second windows
